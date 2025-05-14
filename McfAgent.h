@@ -11,6 +11,8 @@ namespace rayconnect {
 class McfAgent {
 public:
     using DataType = std::string;
+    using TopicCallback = std::function<void(const DataType& data)>;
+    using SubscriptionHandle = uint64_t;
 
     explicit McfAgent();
 
@@ -23,6 +25,9 @@ public:
     McfAgent& operator=(McfAgent&&) noexcept;
 
     std::future<DataType> submit_data(DataType data);
+
+    SubscriptionHandle subscribe(const std::string& topic_name, TopicCallback callback);
+    void unsubscribe(SubscriptionHandle handle);
 
     void stop();
 

@@ -6,4 +6,7 @@ project('hellocpp', 'cpp',
 exe = executable('hellocpp', 'hellocpp.cpp', 'McfAgent.cpp', 'RestAgent.cpp',
   install : true)
 
+exe = executable('subscription', 'test_mcf_subscribe.cpp', 'McfAgent.cpp', 'RestAgent.cpp',
+  install : true)
+
 test('basic', exe)
