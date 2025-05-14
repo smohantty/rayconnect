@@ -3,17 +3,13 @@
 #include <vector>
 #include <chrono>
 #include <thread>
+#include <future>
 #include "McfAgent.h"
-
-void simple_data_processor(const rayconnect::McfAgent::DataType& data) {
-    std::cout << "[Processor] Received FINAL data (from RestAgent via McfAgent): " << data << " on thread: " << std::this_thread::get_id() << std::endl;
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-}
 
 int main() {
     std::cout << "Main thread ID: " << std::this_thread::get_id() << std::endl;
 
-    rayconnect::McfAgent agent(simple_data_processor);
+    rayconnect::McfAgent agent;
 
     std::cout << "McfAgent created and worker thread started." << std::endl;
 
@@ -24,16 +20,26 @@ int main() {
         "Msg4-Test"
     };
 
+    std::vector<std::future<rayconnect::McfAgent::DataType>> futures;
+    futures.reserve(messages_to_send.size());
+
+    std::cout << "[Main] Submitting data to McfAgent and collecting futures." << std::endl;
     for (const auto& msg : messages_to_send) {
-        std::cout << "[Main] Submitting initial data to McfAgent: " << msg << std::endl;
-        agent.submit_data(msg);
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        std::cout << "[Main] Submitting data to McfAgent: " << msg << std::endl;
+        futures.push_back(agent.submit_data(msg));
     }
 
-    std::cout << "[Main] All initial data submitted. McfAgent is processing and sending to RestAgent." << std::endl;
-    std::cout << "[Main] Waiting for results to come back through RestAgent and be processed..." << std::endl;
+    std::cout << "[Main] All data submitted. Waiting for and processing results..." << std::endl;
 
-    std::this_thread::sleep_for(std::chrono::seconds(5));
+    for (size_t i = 0; i < futures.size(); ++i) {
+        try {
+            std::cout << "[Main] Waiting for result for message: " << messages_to_send[i] << std::endl;
+            rayconnect::McfAgent::DataType result = futures[i].get();
+            std::cout << "[Main] Received result for \"" << messages_to_send[i] << "\": " << result << " on thread: " << std::this_thread::get_id() << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "[Main] Exception while getting result for \"" << messages_to_send[i] << "\": " << e.what() << std::endl;
+        }
+    }
 
     std::cout << "[Main] Initiating McfAgent stop." << std::endl;
 

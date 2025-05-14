@@ -4,15 +4,15 @@
 #include <string>
 #include <functional>
 #include <memory>
+#include <future>
 
 namespace rayconnect {
 
 class McfAgent {
 public:
     using DataType = std::string;
-    using ProcessingFunction = std::function<void(const DataType&)>;
 
-    explicit McfAgent(ProcessingFunction processor);
+    explicit McfAgent();
 
     ~McfAgent();
 
@@ -22,7 +22,7 @@ public:
     McfAgent(McfAgent&&) noexcept;
     McfAgent& operator=(McfAgent&&) noexcept;
 
-    void submit_data(DataType data);
+    std::future<DataType> submit_data(DataType data);
 
     void stop();
 
