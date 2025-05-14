@@ -5,14 +5,16 @@
 #include <functional>
 #include <memory>
 #include <future>
+#include <cstdint>
 
 namespace rayconnect {
 
 class McfAgent {
 public:
     using DataType = std::string;
-    using TopicCallback = std::function<void(const DataType& data)>;
     using SubscriptionHandle = uint64_t;
+
+    class ITopicListener;
 
     explicit McfAgent();
 
@@ -26,7 +28,7 @@ public:
 
     std::future<DataType> submit_data(DataType data);
 
-    SubscriptionHandle subscribe(const std::string& topic_name, TopicCallback callback);
+    SubscriptionHandle subscribe(const std::string& topic_name, std::weak_ptr<ITopicListener> listener);
     void unsubscribe(SubscriptionHandle handle);
 
     void stop();
@@ -34,6 +36,12 @@ public:
 private:
     class Impl;
     std::unique_ptr<Impl> mPimpl;
+};
+
+class McfAgent::ITopicListener {
+public:
+    virtual ~ITopicListener() = default;
+    virtual void on_topic_data(const std::string& topic_name, const DataType& data) = 0;
 };
 
 } // namespace rayconnect

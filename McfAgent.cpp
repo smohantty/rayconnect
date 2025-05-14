@@ -22,19 +22,19 @@ namespace rayconnect {
 class McfAgent::Impl {
 public:
     using DataType = McfAgent::DataType;
-    using TopicCallback = McfAgent::TopicCallback;
     using SubscriptionHandle = McfAgent::SubscriptionHandle;
+    using ITopicListener = McfAgent::ITopicListener;
 
     struct MessageFromRest {
-        enum class Type { RPC_RESPONSE, TOPIC_BROADCAST };
-        Type type;
-        DataType payload;
+        DataType full_raw_data_from_rest; // Always store the full string from RestAgent
+        bool is_topic_broadcast;
         std::string topic_name_if_broadcast;
+        DataType topic_payload_if_broadcast; // Parsed payload specifically for the topic
     };
 
 private:
     struct SubscriptionInfo {
-        TopicCallback callback;
+        std::weak_ptr<ITopicListener> listener;
         std::string topic_name;
     };
     std::map<SubscriptionHandle, SubscriptionInfo> mSubscriptions;
@@ -49,48 +49,59 @@ private:
     RestAgent mRestAgent;
     std::atomic<bool> mStopRequested;
 
-    MessageFromRest parse_rest_message(const std::string& raw_data) {
+    MessageFromRest parse_rest_message(const std::string& raw_data_from_rest) {
         const std::string topic_marker = "TOPIC:";
-        size_t topic_marker_pos = raw_data.find(topic_marker); // Search for "TOPIC:" anywhere
+        size_t topic_marker_pos = raw_data_from_rest.find(topic_marker);
 
         if (topic_marker_pos != std::string::npos) {
-            // Found "TOPIC:", parse from here
             size_t topic_name_start = topic_marker_pos + topic_marker.length();
-            size_t first_colon_after_topic_name = raw_data.find(':', topic_name_start);
+            size_t first_colon_after_topic_name = raw_data_from_rest.find(':', topic_name_start);
 
             if (first_colon_after_topic_name != std::string::npos) {
-                std::string topic_name = raw_data.substr(topic_name_start, first_colon_after_topic_name - topic_name_start);
-                std::string payload = raw_data.substr(first_colon_after_topic_name + 1);
-                return {MessageFromRest::Type::TOPIC_BROADCAST, std::move(payload), std::move(topic_name)};
+                std::string topic_name = raw_data_from_rest.substr(topic_name_start, first_colon_after_topic_name - topic_name_start);
+                std::string topic_payload = raw_data_from_rest.substr(first_colon_after_topic_name + 1);
+                // For topic broadcasts, the specific topic payload is parsed out.
+                return {raw_data_from_rest, true, std::move(topic_name), std::move(topic_payload)};
             }
-            // else: "TOPIC:" was found, but not the subsequent colon for payload. Treat as malformed/RPC.
         }
-        // Default to RPC_RESPONSE if "TOPIC:" marker not found or format is incorrect after marker
-        return {MessageFromRest::Type::RPC_RESPONSE, raw_data, ""}; // Return the full raw_data as payload for RPC
+        // Default: not a (validly formatted) topic broadcast. topic_payload_if_broadcast will be empty.
+        return {raw_data_from_rest, false, "", ""};
     }
 
-    void dispatch_topic_update(const std::string& topic_name, const DataType& data) {
-        std::vector<TopicCallback> callbacks_to_call;
+    void dispatch_topic_update(const std::string& topic_name, const DataType& topic_data) {
+        std::vector<std::shared_ptr<ITopicListener>> listeners_to_call;
         {
             std::lock_guard<std::mutex> lock(mSubscriptionMutex);
             auto it_topic = mTopicToHandlesMap.find(topic_name);
             if (it_topic != mTopicToHandlesMap.end()) {
+                std::vector<SubscriptionHandle> handles_to_cleanup;
                 for (SubscriptionHandle handle : it_topic->second) {
                     auto it_sub = mSubscriptions.find(handle);
                     if (it_sub != mSubscriptions.end()) {
-                        callbacks_to_call.push_back(it_sub->second.callback);
+                        if (auto listener_shared = it_sub->second.listener.lock()) {
+                            listeners_to_call.push_back(listener_shared);
+                        } else {
+                            handles_to_cleanup.push_back(handle);
+                        }
                     }
+                }
+                for (SubscriptionHandle handle_to_remove : handles_to_cleanup) {
+                    mSubscriptions.erase(handle_to_remove);
+                    it_topic->second.erase(handle_to_remove);
+                }
+                if (it_topic->second.empty()) {
+                    mTopicToHandlesMap.erase(it_topic);
                 }
             }
         }
 
-        for (const auto& cb : callbacks_to_call) {
+        for (const auto& listener_sp : listeners_to_call) {
             try {
-                cb(data);
+                listener_sp->on_topic_data(topic_name, topic_data);
             } catch (const std::exception& e) {
-                std::cerr << "[McfAgent::Impl] Exception in topic callback for topic '" << topic_name << "': " << e.what() << std::endl;
+                std::cerr << "[McfAgent::Impl] Exception in ITopicListener::on_topic_data for topic '" << topic_name << "': " << e.what() << std::endl;
             } catch (...) {
-                std::cerr << "[McfAgent::Impl] Unknown exception in topic callback for topic '" << topic_name << "'" << std::endl;
+                std::cerr << "[McfAgent::Impl] Unknown exception in ITopicListener::on_topic_data for topic '" << topic_name << "'" << std::endl;
             }
         }
     }
@@ -132,10 +143,14 @@ public:
         return future;
     }
 
-    SubscriptionHandle subscribe(const std::string& topic_name, TopicCallback callback) {
+    SubscriptionHandle subscribe(const std::string& topic_name, std::weak_ptr<ITopicListener> listener) {
+        if (listener.expired()) {
+            std::cerr << "[McfAgent::Impl] Warning: Attempt to subscribe with an expired listener for topic: " << topic_name << std::endl;
+            return static_cast<SubscriptionHandle>(-1);
+        }
         std::lock_guard<std::mutex> lock(mSubscriptionMutex);
         SubscriptionHandle handle = mNextSubscriptionHandle++;
-        mSubscriptions[handle] = {callback, topic_name};
+        mSubscriptions[handle] = {listener, topic_name};
         mTopicToHandlesMap[topic_name].insert(handle);
         return handle;
     }
@@ -192,24 +207,26 @@ public:
 
             if (message_item.has_value()) {
                 activity_this_iteration = true;
-                const auto& msg = message_item.value();
-                if (msg.type == MessageFromRest::Type::RPC_RESPONSE) {
-                    std::optional<std::promise<DataType>> opt_promise = mPromiseFulfillmentQueue.wait_and_pop_for(std::chrono::milliseconds(0));
-                    if (opt_promise.has_value()) {
-                        try {
-                            opt_promise.value().set_value(msg.payload);
-                        } catch (const std::future_error& e) {
-                            std::cerr << "McfAgent::Impl: std::future_error setting RPC promise value: " << e.what() << " code: " << e.code() << std::endl;
-                        } catch (const std::exception& e) {
-                            std::cerr << "McfAgent::Impl: Exception setting RPC promise value: " << e.what() << std::endl;
-                        } catch (...) {
-                            std::cerr << "McfAgent::Impl: Unknown exception setting RPC promise value." << std::endl;
-                        }
-                    } else {
-                        std::cerr << "McfAgent::Impl: Received RPC response from RestAgent but no pending promise. Payload: " << msg.payload << std::endl;
+                const auto& msg_from_rest = message_item.value();
+
+                std::optional<std::promise<DataType>> opt_promise = mPromiseFulfillmentQueue.wait_and_pop_for(std::chrono::milliseconds(0));
+                if (opt_promise.has_value()) {
+                    try {
+                        opt_promise.value().set_value(msg_from_rest.full_raw_data_from_rest);
+                    } catch (const std::future_error& e) {
+                        std::cerr << "McfAgent::Impl: std::future_error setting promise value: " << e.what() << " code: " << e.code() << std::endl;
+                    } catch (const std::exception& e) {
+                        std::cerr << "McfAgent::Impl: Exception setting promise value: " << e.what() << std::endl;
+                    } catch (...) {
+                        std::cerr << "McfAgent::Impl: Unknown exception setting promise value." << std::endl;
                     }
-                } else if (msg.type == MessageFromRest::Type::TOPIC_BROADCAST) {
-                    dispatch_topic_update(msg.topic_name_if_broadcast, msg.payload);
+                } else {
+                    std::cerr << "McfAgent::Impl: Received data from RestAgent ('" << msg_from_rest.full_raw_data_from_rest
+                              << "') but no pending promise in mPromiseFulfillmentQueue." << std::endl;
+                }
+
+                if (msg_from_rest.is_topic_broadcast) {
+                    dispatch_topic_update(msg_from_rest.topic_name_if_broadcast, msg_from_rest.topic_payload_if_broadcast);
                 }
             }
 
@@ -243,11 +260,11 @@ std::future<McfAgent::DataType> McfAgent::submit_data(DataType data) {
     return p.get_future();
 }
 
-McfAgent::SubscriptionHandle McfAgent::subscribe(const std::string& topic_name, TopicCallback callback) {
+McfAgent::SubscriptionHandle McfAgent::subscribe(const std::string& topic_name, std::weak_ptr<ITopicListener> listener) {
     if (mPimpl) {
-        return mPimpl->subscribe(topic_name, std::move(callback));
+        return mPimpl->subscribe(topic_name, listener);
     }
-    std::cerr << "[McfAgent] Warning: subscribe called on uninitialized or moved-from McfAgent." << std::endl;
+    std::cerr << "[McfAgent] Warning: subscribe called on uninitialized or moved-from McfAgent for topic: " << topic_name << std::endl;
     return static_cast<SubscriptionHandle>(-1);
 }
 
