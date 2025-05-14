@@ -50,17 +50,23 @@ private:
     std::atomic<bool> mStopRequested;
 
     MessageFromRest parse_rest_message(const std::string& raw_data) {
-        if (raw_data.rfind("TOPIC:", 0) == 0) {
-            std::string TpcStr = "TOPIC:";
-            size_t topic_prefix_len = TpcStr.length();
-            size_t first_colon = raw_data.find(':', topic_prefix_len);
-            if (first_colon != std::string::npos) {
-                std::string topic_name = raw_data.substr(topic_prefix_len, first_colon - topic_prefix_len);
-                std::string payload = raw_data.substr(first_colon + 1);
+        const std::string topic_marker = "TOPIC:";
+        size_t topic_marker_pos = raw_data.find(topic_marker); // Search for "TOPIC:" anywhere
+
+        if (topic_marker_pos != std::string::npos) {
+            // Found "TOPIC:", parse from here
+            size_t topic_name_start = topic_marker_pos + topic_marker.length();
+            size_t first_colon_after_topic_name = raw_data.find(':', topic_name_start);
+
+            if (first_colon_after_topic_name != std::string::npos) {
+                std::string topic_name = raw_data.substr(topic_name_start, first_colon_after_topic_name - topic_name_start);
+                std::string payload = raw_data.substr(first_colon_after_topic_name + 1);
                 return {MessageFromRest::Type::TOPIC_BROADCAST, std::move(payload), std::move(topic_name)};
             }
+            // else: "TOPIC:" was found, but not the subsequent colon for payload. Treat as malformed/RPC.
         }
-        return {MessageFromRest::Type::RPC_RESPONSE, raw_data, ""};
+        // Default to RPC_RESPONSE if "TOPIC:" marker not found or format is incorrect after marker
+        return {MessageFromRest::Type::RPC_RESPONSE, raw_data, ""}; // Return the full raw_data as payload for RPC
     }
 
     void dispatch_topic_update(const std::string& topic_name, const DataType& data) {
